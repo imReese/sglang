@@ -13,9 +13,8 @@ distributed under the License is distributed on an "AS IS" BASIS,
 # ==============================================================================
 """One CPU Scheduler driving eight out-of-process ModelRunners.
 
-This module is the first process-topology refactor only. It deliberately keeps
-SGLang's existing Scheduler/Req/ScheduleBatch/RadixCache logic and changes the
-execution ownership underneath it:
+This module keeps SGLang's existing Scheduler/Req/ScheduleBatch/RadixCache
+logic and changes the execution ownership underneath it:
 
     1 Scheduler process (CPU canonical metadata, no model/NCCL)
               |
@@ -24,9 +23,8 @@ execution ownership underneath it:
     MR0 ...             ... MR7
     TP0/EP0             TP7/EP7
 
-The first slice is synchronous and intentionally narrow. Later patches can
-restore overlap and widen feature coverage after this 9-process topology runs
-prefill->decode correctly.
+The first slice is synchronous. Standard HiCache L2 is Scheduler-owned at the
+control plane while the physical D<->H transfers stay inside ModelRunner ranks.
 """
 
 from __future__ import annotations
@@ -61,8 +59,12 @@ from sglang.srt.model_executor.single_scheduler_executor import (
     ModelExecutor,
     SingleSchedulerExecutorError,
 )
+from sglang.srt.model_executor.single_scheduler_hicache import (
+    build_scheduler_hiradix_cache,
+)
 from sglang.srt.runtime_context import (
     get_context,
+    get_observability,
     get_parallel,
     get_schedule,
     publish,
@@ -100,7 +102,6 @@ class SingleSchedulerRequestReceiver(SchedulerRequestReceiver):
         return recv_reqs or []
 
     def _finalize_shm_features(self, recv_reqs):
-        # No scheduler-rank broadcast means there is no peer unpickling barrier.
         if recv_reqs:
             from sglang.srt.managers.mm_utils import unwrap_shm_features
 
@@ -128,8 +129,8 @@ def validate_single_scheduler_server_args(server_args: ServerArgs) -> None:
             "single-Scheduler model core must run synchronously in the first runner split",
         ),
         (
-            not server_args.enable_hierarchical_cache,
-            "HiCache is not supported in the first runner split",
+            getattr(server_args, "hicache_storage_backend", None) is None,
+            "single-Scheduler HiCache currently supports L2 only; L3 storage is not supported",
         ),
         (not server_args.enable_lora, "LoRA is not supported in the first runner split"),
         (
@@ -237,6 +238,9 @@ class SingleScheduler(Scheduler):
         validate_single_scheduler_server_args(server_args)
         self._runner_connections = list(runner_connections)
         self._runner_shutdown = False
+        self._single_scheduler_hicache_enabled = bool(
+            server_args.enable_hierarchical_cache
+        )
         super().__init__(
             server_args=server_args,
             port_args=port_args,
@@ -249,12 +253,7 @@ class SingleScheduler(Scheduler):
             dp_rank=None,
         )
 
-    # ---------------------------------------------------------------------
-    # Startup: retain Scheduler construction, replace only GPU/model ownership.
-    # ---------------------------------------------------------------------
-
     def init_moe_gemm_config(self):
-        # MoE runtime/kernel configuration belongs in ModelRunner processes now.
         self.require_mlp_sync = False
 
     def init_mamba_backend(self) -> None:
@@ -295,8 +294,6 @@ class SingleScheduler(Scheduler):
             server_args=self.server_args,
         )
         self.model_executor = executor
-        # Compatibility names used throughout existing Scheduler components.
-        # Neither value is a ModelRunner; both point at the thin process executor.
         self.tp_worker = executor
         self.model_worker = executor
         self.draft_worker = None
@@ -319,8 +316,6 @@ class SingleScheduler(Scheduler):
         self.startup_available_gpu_memory_gb = info.available_gpu_memory_gb
         self.min_free_slots_delayer = None
 
-        # Logical topology only. The actual model process groups live inside
-        # the eight ModelRunner processes and are never exposed to this process.
         self.tp_group = get_parallel().tp_group
         self.tp_cpu_group = None
         self.attn_tp_group = get_parallel().attn_tp_group
@@ -335,18 +330,38 @@ class SingleScheduler(Scheduler):
         self.pad_input_ids_func = None
         set_random_seed(self.random_seed)
 
+        # The stock kv_cache_builder assumes HiCache control/data live in this
+        # process. Build its ordinary CPU radix metadata first; init_hisparse_coordinator
+        # replaces that empty startup tree with the remote HiRadixCache control plane
+        # before any request can be scheduled.
+        if self._single_scheduler_hicache_enabled:
+            if executor.get_hicache_controller() is None:
+                raise ValueError("HiCache was enabled but ModelRunner L2 did not initialize")
+            self.enable_hierarchical_cache = False
+
     def emit_metrics_constants(self) -> None:
-        # Base metrics expect a physical model/KV object in the Scheduler process.
-        # Keep startup functional first; runner-side memory metrics can be wired
-        # back through RunnerInitInfo in a follow-up.
         return None
 
     def init_hisparse_coordinator(self) -> None:
         self.hisparse_coordinator = None
+        if not self._single_scheduler_hicache_enabled:
+            return
+
+        controller = self.model_executor.get_hicache_controller()
+        if controller is None:
+            raise RuntimeError("single-Scheduler HiCache controller is missing")
+        self.tree_cache = build_scheduler_hiradix_cache(
+            server_args=self.server_args,
+            req_to_token_pool=self.req_to_token_pool,
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            remote_controller=controller,
+            page_size=self.page_size,
+            disable=self.disable_radix_cache,
+            enable_metrics=get_observability().enable_metrics,
+        )
+        self.enable_hierarchical_cache = True
 
     def init_overlap(self):
-        # No CUDA stream or FutureMap in the Scheduler process. Normal-generation
-        # token relay is a CPU req-slot-indexed buffer for this synchronous slice.
         self._next_token_ids = torch.zeros(
             self.req_to_token_pool.req_to_token.shape[0], dtype=torch.int64
         )
@@ -384,13 +399,7 @@ class SingleScheduler(Scheduler):
     def init_dp_attn_adapter(self) -> None:
         self.dp_attn_adapter = None
 
-    # ---------------------------------------------------------------------
-    # Serving: Scheduler still schedules; ModelExecutor only executes.
-    # ---------------------------------------------------------------------
-
     def run_event_loop(self) -> None:
-        # First milestone is intentionally synchronous. No scheduler-side CUDA
-        # stream exists, so dispatch directly to the stock normal scheduling loop.
         self.event_loop_normal()
 
     def _resolve_runner_inputs(self, batch: ScheduleBatch) -> None:
@@ -454,8 +463,6 @@ class SingleScheduler(Scheduler):
         return result
 
     def flush_cache(self, empty_cache: bool = True):
-        # The Scheduler owns CPU metadata only; never initialize a CUDA context
-        # just to empty an allocator cache in this ninth process.
         return super().flush_cache(empty_cache=False)
 
     def handle_shutdown(self, recv_req: ShutdownReq):
@@ -474,8 +481,6 @@ class SingleScheduler(Scheduler):
 
 
 def _install_scheduler_cpu_attention_override() -> None:
-    """Make allocation.py use its CPU writer in the canonical Scheduler mirror."""
-
     context = get_context()
     fields = {}
     for name in (

@@ -18,6 +18,10 @@ from sglang.srt.model_executor.single_scheduler_executor import (
     ModelExecutor,
     SingleSchedulerExecutorError,
 )
+from sglang.srt.model_executor.single_scheduler_hicache import (
+    RemoteHiCacheController,
+    SingleSchedulerHiCacheError,
+)
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
@@ -34,6 +38,7 @@ def _args(**overrides):
         speculative_algorithm=None,
         disable_overlap_schedule=True,
         enable_hierarchical_cache=False,
+        hicache_storage_backend=None,
         enable_lora=False,
         page_size=1,
         enable_mixed_chunk=False,
@@ -69,6 +74,20 @@ class _MetadataKVCache:
         return None
 
 
+class _CanonicalAllocator:
+    def __init__(self):
+        self.freed = []
+        self.next_slot = 40
+
+    def alloc(self, count):
+        out = torch.arange(self.next_slot, self.next_slot + count, dtype=torch.int64)
+        self.next_slot += count
+        return out
+
+    def free(self, indices):
+        self.freed.append(indices.clone())
+
+
 class TestSingleSchedulerProcessSplit(unittest.TestCase):
     def test_pilot_topology_is_accepted(self):
         validate_single_scheduler_server_args(_args())
@@ -82,6 +101,20 @@ class TestSingleSchedulerProcessSplit(unittest.TestCase):
         self.assertTrue(model_core_args.disable_overlap_schedule)
         self.assertEqual(model_core_args.page_size, 256)
         validate_single_scheduler_server_args(model_core_args)
+
+    def test_hicache_l2_is_accepted_without_changing_topology_args(self):
+        validate_single_scheduler_server_args(
+            _args(enable_hierarchical_cache=True, hicache_storage_backend=None)
+        )
+
+    def test_hicache_l3_stays_fail_closed(self):
+        with self.assertRaisesRegex(ValueError, "supports L2 only"):
+            validate_single_scheduler_server_args(
+                _args(
+                    enable_hierarchical_cache=True,
+                    hicache_storage_backend="mooncake",
+                )
+            )
 
     def test_topology_fails_closed(self):
         with self.assertRaisesRegex(ValueError, "--tp-size must be 8"):
@@ -143,6 +176,66 @@ class TestSingleSchedulerProcessSplit(unittest.TestCase):
             last_loc=torch.tensor([7], dtype=torch.int64),
         )
         self.assertEqual(decode_new_page.tolist(), [8])
+
+    def test_remote_hicache_uses_one_canonical_device_allocation(self):
+        calls = []
+
+        def fanout(kind, **kwargs):
+            calls.append((kind, kwargs))
+            if kind == "hicache_write":
+                return [torch.tensor([8, 9], dtype=torch.int64) for _ in range(8)]
+            return [None] * 8
+
+        allocator = _CanonicalAllocator()
+        controller = RemoteHiCacheController(
+            fanout=fanout,
+            device_allocator=allocator,
+            host_size=64,
+            host_logical_size=64,
+            host_page_size=1,
+            host_size_per_token=16,
+            write_policy="write_through",
+        )
+
+        host = controller.write(torch.tensor([20, 21], dtype=torch.int64), node_id=7)
+        self.assertEqual(host.tolist(), [8, 9])
+        self.assertTrue(controller.ack_write_queue[0].finish_event.query())
+        self.assertEqual(controller.mem_pool_host.available_size(), 62)
+
+        device = controller.load(host, node_id=7)
+        self.assertEqual(device.tolist(), [40, 41])
+        self.assertEqual(calls[-1][0], "hicache_load")
+        self.assertEqual(calls[-1][1]["host_indices"].tolist(), [8, 9])
+        self.assertEqual(calls[-1][1]["device_indices"].tolist(), [40, 41])
+        self.assertTrue(controller.ack_load_queue[0].finish_event.query())
+
+        controller.evict_host(host)
+        self.assertEqual(calls[-1][0], "hicache_free_host")
+        self.assertEqual(controller.mem_pool_host.available_size(), 64)
+
+    def test_remote_hicache_rejects_rank_divergent_host_slots(self):
+        def fanout(kind, **kwargs):
+            del kwargs
+            if kind == "hicache_write":
+                return [
+                    torch.tensor([8, 9], dtype=torch.int64)
+                    if rank < 7
+                    else torch.tensor([10, 11], dtype=torch.int64)
+                    for rank in range(8)
+                ]
+            return [None] * 8
+
+        controller = RemoteHiCacheController(
+            fanout=fanout,
+            device_allocator=_CanonicalAllocator(),
+            host_size=64,
+            host_logical_size=64,
+            host_page_size=1,
+            host_size_per_token=16,
+            write_policy="write_through",
+        )
+        with self.assertRaisesRegex(SingleSchedulerHiCacheError, "diverged"):
+            controller.write(torch.tensor([20, 21], dtype=torch.int64), node_id=7)
 
 
 if __name__ == "__main__":
