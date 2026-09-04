@@ -138,7 +138,7 @@ def _add_admin_routes(app, request_manager):
             results = await request_manager.send_communicator_req(
                 req, "profile_communicator", timeout=600.0
             )
-            err = _check_communicator_results(results, "Stop profile")
+            err = _check_communicator_results(results, "Stop Profile")
             if err:
                 return err
             return web.Response(text="Stop profiling. This will take some time.\n")
@@ -153,10 +153,17 @@ def _add_admin_routes(app, request_manager):
     app.router.add_post("/stop_profile", stop_profile_handler)
 
 
-async def serve_grpc(server_args, model_info=None):
-    """Start the standalone gRPC server with integrated scheduler."""
+async def serve_grpc(server_args, model_info=None, scheduler_launcher=None):
+    """Start the standalone gRPC server with integrated scheduler.
+
+    ``scheduler_launcher`` is an optional process-topology injection point.  It
+    keeps gRPC transport independent from whether the model core is the legacy
+    replicated-Scheduler layout or the 1-Scheduler/8-ModelRunner layout.
+    """
     try:
-        from smg_grpc_servicer.sglang.server import serve_grpc as _serve_grpc
+        import smg_grpc_servicer.sglang.server as _smg_server
+
+        _serve_grpc = _smg_server.serve_grpc
     except ImportError as e:
         raise ImportError(
             "gRPC mode requires the smg-grpc-servicer package. "
@@ -164,6 +171,17 @@ async def serve_grpc(server_args, model_info=None):
             "If already installed, there may be a broken import due to a "
             "version mismatch — see the chained exception above for details."
         ) from e
+
+    previous_scheduler_launcher = None
+    if scheduler_launcher is not None:
+        if not hasattr(_smg_server, "launch_scheduler_process_only"):
+            raise RuntimeError(
+                "Installed smg-grpc-servicer does not expose "
+                "launch_scheduler_process_only; cannot inject the single-Scheduler "
+                "model-core topology."
+            )
+        previous_scheduler_launcher = _smg_server.launch_scheduler_process_only
+        _smg_server.launch_scheduler_process_only = scheduler_launcher
 
     sidecar_app = web.Application()
     sidecar_runner = None
@@ -233,9 +251,6 @@ async def serve_grpc(server_args, model_info=None):
     if sidecar_supported:
         serve_kwargs["on_request_manager_ready"] = _on_request_manager_ready
     elif server_args.enable_metrics:
-        # User explicitly asked for metrics but the installed servicer can't
-        # start the sidecar that serves them — fail loud rather than silently
-        # produce a server with no /metrics endpoint.
         raise RuntimeError(
             "--enable-metrics requires smg-grpc-servicer ≥ 0.5.3 (the version "
             "that accepts 'on_request_manager_ready'); installed version "
@@ -253,6 +268,8 @@ async def serve_grpc(server_args, model_info=None):
     try:
         await _serve_grpc(server_args, model_info, **serve_kwargs)
     finally:
+        if previous_scheduler_launcher is not None:
+            _smg_server.launch_scheduler_process_only = previous_scheduler_launcher
         if sidecar_runner is not None:
             try:
                 await sidecar_runner.cleanup()

@@ -185,7 +185,19 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             )
 
         bs = len(prefix_lens)
-        if self.need_sort and extend_num_tokens // self.page_size + bs + 1 > len(
+        is_cpu_metadata = torch.device(self.device).type == "cpu"
+        if is_cpu_metadata:
+            if num_new_pages is None:
+                num_new_pages = get_num_new_pages(
+                    seq_lens=seq_lens_cpu,
+                    page_size=self.page_size,
+                    prefix_lens=prefix_lens_cpu,
+                )
+            if self.need_sort and num_new_pages > len(self.free_pages):
+                self.merge_and_sort_free()
+            if num_new_pages > len(self.free_pages):
+                return None
+        elif self.need_sort and extend_num_tokens // self.page_size + bs + 1 > len(
             self.free_pages
         ):
             self.merge_and_sort_free()
@@ -194,15 +206,26 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             (extend_num_tokens,), dtype=torch.int64, device=self.device
         )
 
-        alloc_extend_kernel[(bs,)](
-            prefix_lens,
-            seq_lens,
-            last_loc,
-            self.free_pages,
-            out_indices,
-            next_power_of_2(bs),
-            self.page_size,
-        )
+        if is_cpu_metadata:
+            alloc_extend_naive(
+                prefix_lens,
+                seq_lens,
+                last_loc,
+                self.free_pages,
+                out_indices,
+                self.page_size,
+                self.device,
+            )
+        else:
+            alloc_extend_kernel[(bs,)](
+                prefix_lens,
+                seq_lens,
+                last_loc,
+                self.free_pages,
+                out_indices,
+                next_power_of_2(bs),
+                self.page_size,
+            )
 
         if self.debug_mode:
             assert len(torch.unique(out_indices)) == len(out_indices)
@@ -231,29 +254,40 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             )
 
         bs = len(seq_lens)
-        if self.need_sort and bs > len(self.free_pages):
-            self.merge_and_sort_free()
-
-        out_indices = torch.empty((bs,), dtype=torch.int64, device=self.device)
-        alloc_decode_kernel[(bs,)](
-            seq_lens,
-            last_loc,
-            self.free_pages,
-            out_indices,
-            next_power_of_2(bs),
-            self.page_size,
-        )
-
-        if self.debug_mode:
-            assert len(torch.unique(out_indices)) == len(out_indices)
-
+        is_cpu_metadata = torch.device(self.device).type == "cpu"
         num_new_pages = get_num_new_pages(
             seq_lens=seq_lens_cpu,
             page_size=self.page_size,
             decode=True,
         )
+
+        sort_need = num_new_pages if is_cpu_metadata else bs
+        if self.need_sort and sort_need > len(self.free_pages):
+            self.merge_and_sort_free()
         if num_new_pages > len(self.free_pages):
             return None
+
+        if is_cpu_metadata:
+            out_indices = (last_loc + 1).to(dtype=torch.int64).clone()
+            needs_new_page = (seq_lens - 1) % self.page_size == 0
+            if num_new_pages:
+                page_starts = self.free_pages[:num_new_pages] * self.page_size
+                out_indices[needs_new_page] = page_starts
+            if self.debug_mode:
+                assert int(needs_new_page.sum().item()) == num_new_pages
+        else:
+            out_indices = torch.empty((bs,), dtype=torch.int64, device=self.device)
+            alloc_decode_kernel[(bs,)](
+                seq_lens,
+                last_loc,
+                self.free_pages,
+                out_indices,
+                next_power_of_2(bs),
+                self.page_size,
+            )
+
+        if self.debug_mode:
+            assert len(torch.unique(out_indices)) == len(out_indices)
 
         self.free_pages = self.free_pages[num_new_pages:]
         return out_indices
