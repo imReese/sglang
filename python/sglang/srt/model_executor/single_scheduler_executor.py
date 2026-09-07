@@ -18,10 +18,9 @@ and KV slot ids once. Eight rank-local ModelRunner processes own all CUDA/NCCL
 state and mirror those integer ids into their local ReqToTokenPool before each
 forward. The Scheduler itself never joins the model distributed world.
 
-This is intentionally a narrow first slice: DP1/TP8/EP8/PP1/CP1, normal text
-generation, synchronous scheduling, no speculation/HiCache/LoRA. Both token
-and paged KV allocators are supported so the process split preserves the
-model/backend-resolved page size.
+The first slice is synchronous and supports normal generation plus the standard
+HiCache L2 data path. Token and paged KV allocators preserve the model/backend
+resolved page size; HiCache physical host/device bytes stay rank-local.
 """
 
 from __future__ import annotations
@@ -56,6 +55,11 @@ from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
     ForwardMode,
+)
+from sglang.srt.model_executor.single_scheduler_hicache import (
+    RemoteHiCacheController,
+    execute_runner_hicache_command,
+    init_runner_hicache_l2,
 )
 from sglang.srt.plugins import load_plugins
 from sglang.srt.runtime_context import get_schedule, publish
@@ -95,6 +99,11 @@ class RunnerInitInfo:
     graph_memory_usage: dict[str, float] = field(default_factory=dict)
     graph_time_usage: dict[str, float] = field(default_factory=dict)
     available_gpu_memory_gb: float = 0.0
+    hicache_enabled: bool = False
+    hicache_host_size: int = 0
+    hicache_host_logical_size: int = 0
+    hicache_host_page_size: int = 1
+    hicache_host_size_per_token: int = 0
     error: Optional[str] = None
     remote_traceback: Optional[str] = None
 
@@ -235,12 +244,16 @@ class ModelRunnerBatch:
 class RunnerCommand:
     kind: str
     batch: Optional[ModelRunnerBatch] = None
+    host_indices: Optional[torch.Tensor] = None
+    device_indices: Optional[torch.Tensor] = None
+    node_id: int = -1
 
 
 @dataclass(frozen=True, slots=True)
 class RunnerReply:
     rank: int
     result: Optional[GenerationBatchResult] = None
+    host_indices: Optional[torch.Tensor] = None
     error: Optional[str] = None
     remote_traceback: Optional[str] = None
 
@@ -346,6 +359,35 @@ class ModelExecutor:
             attn_backend=SimpleNamespace(),
         )
 
+        self.hicache_controller = None
+        if server_args.enable_hierarchical_cache:
+            if not all(info.hicache_enabled for info in infos):
+                raise SingleSchedulerExecutorError(
+                    "HiCache was requested but at least one ModelRunner did not initialize L2"
+                )
+            host_geometry = {
+                (
+                    info.hicache_host_size,
+                    info.hicache_host_logical_size,
+                    info.hicache_host_page_size,
+                    info.hicache_host_size_per_token,
+                )
+                for info in infos
+            }
+            if len(host_geometry) != 1:
+                raise SingleSchedulerExecutorError(
+                    f"HiCache host-pool geometry diverged across ranks: {sorted(host_geometry)}"
+                )
+            self.hicache_controller = RemoteHiCacheController(
+                fanout=self._run_hicache_command,
+                device_allocator=self.token_to_kv_pool_allocator,
+                host_size=leader.hicache_host_size,
+                host_logical_size=leader.hicache_host_logical_size,
+                host_page_size=leader.hicache_host_page_size,
+                host_size_per_token=leader.hicache_host_size_per_token,
+                write_policy=server_args.hicache_write_policy,
+            )
+
     @property
     def leader_info(self) -> RunnerInitInfo:
         return self.runner_infos[0]
@@ -362,12 +404,10 @@ class ModelExecutor:
     def register_hicache_layer_transfer_counter(self, _counter) -> None:
         return None
 
-    def run_batch(self, batch: ScheduleBatch) -> GenerationBatchResult:
-        wire_batch = ModelRunnerBatch.from_schedule_batch(batch)
-        command = RunnerCommand(kind="execute", batch=wire_batch)
-        for conn in self._connections:
-            conn.send(command)
+    def get_hicache_controller(self):
+        return self.hicache_controller
 
+    def _collect_replies(self) -> list[RunnerReply]:
         replies = [conn.recv() for conn in self._connections]
         for expected_rank, reply in enumerate(replies):
             if not isinstance(reply, RunnerReply) or reply.rank != expected_rank:
@@ -381,7 +421,33 @@ class ModelExecutor:
                 raise SingleSchedulerExecutorError(
                     f"ModelRunner rank {expected_rank} failed: {detail}"
                 )
+        return replies
 
+    def _run_hicache_command(
+        self,
+        kind: str,
+        *,
+        host_indices: Optional[torch.Tensor] = None,
+        device_indices: Optional[torch.Tensor] = None,
+        node_id: int = -1,
+    ) -> list[Optional[torch.Tensor]]:
+        command = RunnerCommand(
+            kind=kind,
+            host_indices=host_indices,
+            device_indices=device_indices,
+            node_id=node_id,
+        )
+        for conn in self._connections:
+            conn.send(command)
+        return [reply.host_indices for reply in self._collect_replies()]
+
+    def run_batch(self, batch: ScheduleBatch) -> GenerationBatchResult:
+        wire_batch = ModelRunnerBatch.from_schedule_batch(batch)
+        command = RunnerCommand(kind="execute", batch=wire_batch)
+        for conn in self._connections:
+            conn.send(command)
+
+        replies = self._collect_replies()
         result = replies[0].result
         if result is None:
             raise SingleSchedulerExecutorError("rank0 returned no generation result")
@@ -572,6 +638,7 @@ def run_model_runner_process(
                 f"{type(allocator).__name__}"
             )
 
+        hicache_controller, hicache_info = init_runner_hicache_l2(runner, server_args)
         connection.send(
             RunnerInitInfo(
                 rank=rank,
@@ -588,6 +655,15 @@ def run_model_runner_process(
                 graph_time_usage=dict(runner.graph_time_usage),
                 available_gpu_memory_gb=get_available_gpu_memory(
                     runner.device, gpu_id, empty_cache=False
+                ),
+                hicache_enabled=hicache_controller is not None,
+                hicache_host_size=(hicache_info or {}).get("host_size", 0),
+                hicache_host_logical_size=(hicache_info or {}).get(
+                    "host_logical_size", 0
+                ),
+                hicache_host_page_size=(hicache_info or {}).get("host_page_size", 1),
+                hicache_host_size_per_token=(hicache_info or {}).get(
+                    "host_size_per_token", 0
                 ),
             )
         )
@@ -616,16 +692,31 @@ def run_model_runner_process(
             continue
         if command.kind == "shutdown":
             return
-        if command.kind != "execute" or command.batch is None:
-            connection.send(
-                RunnerReply(rank=rank, error=f"invalid runner command: {command.kind!r}")
-            )
-            continue
+
         try:
-            result = _execute_batch(
-                command.batch, runner, return_result=(rank == 0)
+            if command.kind == "execute":
+                if command.batch is None:
+                    raise SingleSchedulerExecutorError("execute command has no batch")
+                result = _execute_batch(
+                    command.batch, runner, return_result=(rank == 0)
+                )
+                connection.send(RunnerReply(rank=rank, result=result))
+                continue
+
+            if command.kind.startswith("hicache_"):
+                host_indices = execute_runner_hicache_command(
+                    hicache_controller,
+                    kind=command.kind,
+                    host_indices=command.host_indices,
+                    device_indices=command.device_indices,
+                    node_id=command.node_id,
+                )
+                connection.send(RunnerReply(rank=rank, host_indices=host_indices))
+                continue
+
+            raise SingleSchedulerExecutorError(
+                f"invalid runner command: {command.kind!r}"
             )
-            connection.send(RunnerReply(rank=rank, result=result))
         except Exception as exc:
             connection.send(
                 RunnerReply(
